@@ -1,0 +1,106 @@
+name: Mount Wilson ticket watcher
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for newly bookable events
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.request
+          from datetime import datetime, timezone
+
+          PAGE = "https://www.mtwilson.edu/public-ticket-nights/"
+          TOPIC = os.environ["NTFY_TOPIC"]
+          STATE = "mtwilson_state.json"
+          UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+          SOLD_OUT = re.compile(r"sold\s*out\s*public\s*ticket\s*nights", re.I)
+          LINK = re.compile(
+              r'href="https?://(?:www\.)?mtwilson\.edu/events/(ptn[a-z0-9\-]+)/?"[^>]*>\s*([^<]*)',
+              re.I)
+
+          def notify(title, body, priority="default", tags="telescope"):
+              req = urllib.request.Request(
+                  "https://ntfy.sh/" + TOPIC, data=body.encode("utf-8"),
+                  headers={"Title": title, "Priority": priority, "Tags": tags, "Click": PAGE})
+              try:
+                  urllib.request.urlopen(req, timeout=30).read()
+              except Exception as exc:
+                  print("Notification failed:", exc)
+
+          def parse(html):
+              m = SOLD_OUT.search(html)
+              section = html[:m.start()] if m else html
+              found = {}
+              for slug, text in LINK.findall(section):
+                  text = " ".join(text.split())
+                  if len(text) > len(found.get(slug, "")):
+                      found[slug] = text
+              return {s: (t or s) for s, t in found.items()}, bool(m)
+
+          # Fetch the page. A network blip is transient, so leave the state alone.
+          try:
+              req = urllib.request.Request(PAGE, headers={"User-Agent": UA})
+              html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+          except Exception as exc:
+              print("Fetch failed:", exc)
+              sys.exit(1)
+
+          events, saw_marker = parse(html)
+          state = json.load(open(STATE)) if os.path.exists(STATE) else None
+          known = set(state.get("known", [])) if state else set()
+          warned = bool(state.get("structure_warned")) if state else False
+
+          open("last-checked.txt", "w").write(
+              datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "\n")
+
+          if not saw_marker:
+              # Layout changed, so bookable cannot be told apart from sold out.
+              if not warned:
+                  notify("Mount Wilson page changed",
+                         "The watcher can no longer tell bookable events from sold out ones. "
+                         "Check the page yourself.", "high", "warning")
+              json.dump({"known": sorted(known), "structure_warned": True}, open(STATE, "w"), indent=2)
+              sys.exit(0)
+
+          if state is None:
+              listing = "\n".join(sorted(events.values())) or "nothing bookable right now"
+              notify("Ticket watcher is live",
+                     "Watching Mount Wilson Public Ticket Nights.\n\nCurrently:\n" + listing,
+                     "default", "white_check_mark")
+              print("Baseline saved:", len(events), "bookable event(s).")
+          else:
+              new = sorted(s for s in events if s not in known)
+              if new:
+                  notify("New Mount Wilson tickets",
+                         "\n".join(events[s] for s in new) + "\n\nThese sell out fast. Tap to book.",
+                         "urgent", "rotating_light,telescope")
+                  print("Notified about", len(new), "new event(s).")
+              else:
+                  print("No change.", len(events), "bookable event(s).")
+
+          json.dump({"known": sorted(events), "structure_warned": False}, open(STATE, "w"), indent=2)
+          PY
+
+      - name: Save state
+        run: |
+          git config user.name "ticket-watcher"
+          git config user.email "actions@github.com"
+          git add mtwilson_state.json last-checked.txt
+          git diff --staged --quiet && exit 0
+          git commit -m "Watcher check $(date -u +%Y-%m-%d\ %H:%M)"
+          git push || (git pull --rebase && git push)
