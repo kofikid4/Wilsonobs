@@ -2,7 +2,7 @@ name: Mount Wilson ticket watcher
 
 on:
   schedule:
-    - cron: "*/30 * * * *"
+    - cron: "7,37 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -19,7 +19,7 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
           python3 - <<'PY'
-          import json, os, re, sys, urllib.request
+          import json, os, re, sys, time, urllib.request
           from datetime import datetime, timezone
 
           PAGE = "https://www.mtwilson.edu/public-ticket-nights/"
@@ -28,6 +28,7 @@ jobs:
           UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
 
+          LANDMARK = re.compile(r"pubtix@mtwilson\.edu", re.I)
           SOLD_OUT = re.compile(r"sold\s*out\s*public\s*ticket\s*nights", re.I)
           LINK = re.compile(
               r'href="https?://(?:www\.)?mtwilson\.edu/events/(ptn[a-z0-9\-]+)/?"[^>]*>\s*([^<]*)',
@@ -52,14 +53,32 @@ jobs:
                       found[slug] = text
               return {s: (t or s) for s, t in found.items()}, bool(m)
 
-          # Fetch the page. A network blip is transient, so leave the state alone.
-          try:
-              req = urllib.request.Request(PAGE, headers={"User-Agent": UA})
-              html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
-          except Exception as exc:
-              print("Fetch failed:", exc)
+          def usable(html):
+              # A trustworthy page has the boilerplate AND a rendered event grid.
+              # Boilerplate alone means the grid failed to load, which is not a redesign.
+              return bool(LANDMARK.search(html)) and len(LINK.findall(html)) > 0
+
+          def fetch():
+              last = None
+              for attempt in (1, 2, 3):
+                  try:
+                      req = urllib.request.Request(
+                          PAGE, headers={"User-Agent": UA, "Accept-Encoding": "identity"})
+                      html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+                      print("attempt %d: %d bytes, landmark=%s, event links=%d"
+                            % (attempt, len(html), bool(LANDMARK.search(html)),
+                               len(set(s for s, _ in LINK.findall(html)))))
+                      if usable(html):
+                          return html
+                      last = "unusable response, %d bytes" % len(html)
+                  except Exception as exc:
+                      last = str(exc)
+                      print("attempt %d failed: %s" % (attempt, exc))
+                  time.sleep(10)
+              print("Giving up quietly this run:", last)
               sys.exit(1)
 
+          html = fetch()
           events, saw_marker = parse(html)
           state = json.load(open(STATE)) if os.path.exists(STATE) else None
           known = set(state.get("known", [])) if state else set()
@@ -69,20 +88,24 @@ jobs:
               datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "\n")
 
           if not saw_marker:
-              # Layout changed, so bookable cannot be told apart from sold out.
+              # Page and grid both loaded, but the heading is gone. A human should look.
               if not warned:
                   notify("Mount Wilson page changed",
-                         "The watcher can no longer tell bookable events from sold out ones. "
-                         "Check the page yourself.", "high", "warning")
+                         "The page loaded normally but the sold out heading is gone, so "
+                         "bookable and sold out cannot be told apart. Worth checking.",
+                         "high", "warning")
               json.dump({"known": sorted(known), "structure_warned": True}, open(STATE, "w"), indent=2)
               sys.exit(0)
+
+          print("bookable:", sorted(events))
+          if warned:
+              print("Recovered from previous warning state.")
 
           if state is None:
               listing = "\n".join(sorted(events.values())) or "nothing bookable right now"
               notify("Ticket watcher is live",
                      "Watching Mount Wilson Public Ticket Nights.\n\nCurrently:\n" + listing,
                      "default", "white_check_mark")
-              print("Baseline saved:", len(events), "bookable event(s).")
           else:
               new = sorted(s for s in events if s not in known)
               if new:
