@@ -1,0 +1,109 @@
+name: PiFinder rev4 stock watcher
+
+on:
+  schedule:
+    - cron: "5,35 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check stock status
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.request
+          from datetime import datetime, timezone
+
+          PAGE = "https://www.pifinder.io/shop-pifinder/p/pifinder-rev4"
+          TOPIC = os.environ["NTFY_TOPIC"]
+          STATE = "pifinder_state.json"
+          UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+
+          # Squarespace writes availability and price into meta tags, server side.
+          META_AVAIL = re.compile(r"<meta[^>]*product:availability[^>]*>", re.I)
+          META_PRICE = re.compile(r"<meta[^>]*product:price:amount[^>]*>", re.I)
+          CONTENT = re.compile(r'content="([^"]*)"', re.I)
+
+          # Anything not on this list counts as buyable, including "preorder".
+          # Better a false alarm than a missed restock.
+          UNAVAILABLE = {"oos", "outofstock", "out of stock", "soldout", "sold out", "discontinued"}
+
+          def notify(title, body, priority="default", tags="package"):
+              req = urllib.request.Request(
+                  "https://ntfy.sh/" + TOPIC, data=body.encode("utf-8"),
+                  headers={"Title": title, "Priority": priority, "Tags": tags, "Click": PAGE})
+              try:
+                  urllib.request.urlopen(req, timeout=30).read()
+              except Exception as exc:
+                  print("Notification failed:", exc)
+
+          def meta_value(pattern, html):
+              tag = pattern.search(html)
+              if not tag:
+                  return None
+              value = CONTENT.search(tag.group(0))
+              return value.group(1).strip() if value else None
+
+          try:
+              req = urllib.request.Request(PAGE, headers={"User-Agent": UA})
+              html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
+          except Exception as exc:
+              print("Fetch failed:", exc)
+              sys.exit(1)
+
+          availability = meta_value(META_AVAIL, html)
+          price = meta_value(META_PRICE, html) or "?"
+          state = json.load(open(STATE)) if os.path.exists(STATE) else None
+          was_in_stock = state.get("in_stock") if state else None
+          warned = bool(state.get("structure_warned")) if state else False
+
+          open("last-checked-pifinder.txt", "w").write(
+              datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "\n")
+
+          if availability is None:
+              # Tag is gone, so the check cannot be trusted. Say so instead of staying silent.
+              if not warned:
+                  notify("PiFinder watcher needs attention",
+                         "The availability tag disappeared from the product page. "
+                         "Check the page yourself.", "high", "warning")
+              json.dump({"in_stock": was_in_stock, "structure_warned": True}, open(STATE, "w"), indent=2)
+              sys.exit(0)
+
+          in_stock = availability.lower() not in UNAVAILABLE
+          print("availability =", availability, "| in_stock =", in_stock, "| price =", price)
+
+          if state is None:
+              notify("PiFinder watcher is live",
+                     "Watching PiFinder rev4 ($%s).\n\nCurrent status: %s"
+                     % (price, "IN STOCK" if in_stock else "sold out"),
+                     "urgent" if in_stock else "default",
+                     "rotating_light" if in_stock else "white_check_mark")
+          elif in_stock and not was_in_stock:
+              notify("PiFinder rev4 is available",
+                     "Status changed to '%s'. Price $%s.\n\nTap to order." % (availability, price),
+                     "urgent", "rotating_light,package")
+          elif was_in_stock and not in_stock:
+              notify("PiFinder rev4 sold out again",
+                     "It was available and is now back to '%s'." % availability,
+                     "low", "hourglass")
+
+          json.dump({"in_stock": in_stock, "structure_warned": False}, open(STATE, "w"), indent=2)
+          PY
+
+      - name: Save state
+        run: |
+          git config user.name "stock-watcher"
+          git config user.email "actions@github.com"
+          git add pifinder_state.json last-checked-pifinder.txt
+          git diff --staged --quiet && exit 0
+          git commit -m "PiFinder check $(date -u +%Y-%m-%d\ %H:%M)"
+          git push || (git pull --rebase && git push)
