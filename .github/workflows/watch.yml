@@ -19,20 +19,41 @@ jobs:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
         run: |
           python3 - <<'PY'
-          import json, os, re, sys, time, urllib.request
+          import gzip, http.cookiejar, json, os, re, sys, time, urllib.request
           from datetime import datetime, timezone
 
           PAGE = "https://www.mtwilson.edu/public-ticket-nights/"
           TOPIC = os.environ["NTFY_TOPIC"]
           STATE = "mtwilson_state.json"
-          UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0 Safari/537.36")
+          TIMEOUT = 60
+          ALERT_AFTER = 6
+
+          # A bare urllib request sends only User-Agent, which reads as a bot.
+          HEADERS = {
+              "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
+              "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+                         "image/avif,image/webp,image/apng,*/*;q=0.8"),
+              "Accept-Language": "en-US,en;q=0.9",
+              "Accept-Encoding": "gzip, deflate",
+              "Upgrade-Insecure-Requests": "1",
+              "Sec-Fetch-Dest": "document",
+              "Sec-Fetch-Mode": "navigate",
+              "Sec-Fetch-Site": "none",
+              "Sec-Fetch-User": "?1",
+              "Cache-Control": "max-age=0",
+              "Connection": "close",
+          }
 
           LANDMARK = re.compile(r"pubtix@mtwilson\.edu", re.I)
           SOLD_OUT = re.compile(r"sold\s*out\s*public\s*ticket\s*nights", re.I)
           LINK = re.compile(
               r'href="https?://(?:www\.)?mtwilson\.edu/events/(ptn[a-z0-9\-]+)/?"[^>]*>\s*([^<]*)',
               re.I)
+
+          # Some filters set a cookie and redirect rather than serving the page.
+          opener = urllib.request.build_opener(
+              urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
 
           def notify(title, body, priority="default", tags="telescope"):
               req = urllib.request.Request(
@@ -53,70 +74,96 @@ jobs:
                       found[slug] = text
               return {s: (t or s) for s, t in found.items()}, bool(m)
 
-          def usable(html):
-              # A trustworthy page has the boilerplate AND a rendered event grid.
-              # Boilerplate alone means the grid failed to load, which is not a redesign.
-              return bool(LANDMARK.search(html)) and len(LINK.findall(html)) > 0
+          def get_page():
+              req = urllib.request.Request(PAGE, headers=HEADERS)
+              with opener.open(req, timeout=TIMEOUT) as resp:
+                  raw = resp.read()
+                  if resp.headers.get("Content-Encoding", "") == "gzip":
+                      raw = gzip.decompress(raw)
+                  return raw.decode("utf-8", "replace"), len(raw), resp.geturl(), resp.status
 
-          def fetch():
-              last = None
-              for attempt in (1, 2, 3):
-                  try:
-                      req = urllib.request.Request(
-                          PAGE, headers={"User-Agent": UA, "Accept-Encoding": "identity"})
-                      html = urllib.request.urlopen(req, timeout=30).read().decode("utf-8", "replace")
-                      print("attempt %d: %d bytes, landmark=%s, event links=%d"
-                            % (attempt, len(html), bool(LANDMARK.search(html)),
-                               len(set(s for s, _ in LINK.findall(html)))))
-                      if usable(html):
-                          return html
-                      last = "unusable response, %d bytes" % len(html)
-                  except Exception as exc:
-                      last = str(exc)
-                      print("attempt %d failed: %s" % (attempt, exc))
-                  time.sleep(10)
-              print("Giving up quietly this run:", last)
-              sys.exit(1)
+          state = json.load(open(STATE)) if os.path.exists(STATE) else {}
+          known = set(state.get("known", []))
+          warned = bool(state.get("structure_warned"))
+          fails = int(state.get("fails", 0))
+          alerted = bool(state.get("alerted"))
 
-          html = fetch()
+          def save(**kw):
+              base = {"known": sorted(known), "structure_warned": warned,
+                      "fails": fails, "alerted": alerted}
+              base.update(kw)
+              json.dump(base, open(STATE, "w"), indent=2, sort_keys=True)
+
+          html = None
+          for attempt in (1, 2, 3):
+              try:
+                  body, size, final_url, status = get_page()
+                  links = len(set(s for s, _ in LINK.findall(body)))
+                  print("attempt %d: status=%s, %d bytes, landmark=%s, links=%d"
+                        % (attempt, status, size, bool(LANDMARK.search(body)), links))
+                  if final_url.rstrip("/") != PAGE.rstrip("/"):
+                      print("  redirected to:", final_url)
+                  if size < 3000:
+                      # Small body means we were refused. Show it so we can identify it.
+                      print("  BODY:", repr(body[:600]))
+                  if LANDMARK.search(body) and links:
+                      html = body
+                      break
+              except Exception as exc:
+                  print("attempt %d failed: %s" % (attempt, exc))
+              if attempt < 3:
+                  time.sleep(20)
+
+          if html is None:
+              fails += 1
+              print("No usable response. Consecutive failures:", fails)
+              if fails >= ALERT_AFTER and not alerted:
+                  notify("Mount Wilson watcher is blind",
+                         "Could not reach the page on %d checks in a row. Detection is "
+                         "paused until the site responds normally." % fails, "high", "warning")
+                  alerted = True
+              save(fails=fails, alerted=alerted)
+              sys.exit(0)
+
+          if alerted:
+              notify("Mount Wilson watcher is back",
+                     "The site is responding again and checks have resumed.",
+                     "low", "white_check_mark")
+          if fails:
+              print("Recovered after %d failed check(s)." % fails)
+          fails, alerted = 0, False
+
           events, saw_marker = parse(html)
-          state = json.load(open(STATE)) if os.path.exists(STATE) else None
-          known = set(state.get("known", [])) if state else set()
-          warned = bool(state.get("structure_warned")) if state else False
-
           open("last-checked.txt", "w").write(
               datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "\n")
 
           if not saw_marker:
-              # Page and grid both loaded, but the heading is gone. A human should look.
               if not warned:
                   notify("Mount Wilson page changed",
                          "The page loaded normally but the sold out heading is gone, so "
                          "bookable and sold out cannot be told apart. Worth checking.",
                          "high", "warning")
-              json.dump({"known": sorted(known), "structure_warned": True}, open(STATE, "w"), indent=2)
+              warned = True
+              save()
               sys.exit(0)
 
           print("bookable:", sorted(events))
-          if warned:
-              print("Recovered from previous warning state.")
-
-          if state is None:
+          new = sorted(s for s in events if s not in known)
+          if not state:
               listing = "\n".join(sorted(events.values())) or "nothing bookable right now"
               notify("Ticket watcher is live",
                      "Watching Mount Wilson Public Ticket Nights.\n\nCurrently:\n" + listing,
                      "default", "white_check_mark")
+          elif new:
+              notify("New Mount Wilson tickets",
+                     "\n".join(events[s] for s in new) + "\n\nThese sell out fast. Tap to book.",
+                     "urgent", "rotating_light,telescope")
+              print("Notified about", len(new), "new event(s).")
           else:
-              new = sorted(s for s in events if s not in known)
-              if new:
-                  notify("New Mount Wilson tickets",
-                         "\n".join(events[s] for s in new) + "\n\nThese sell out fast. Tap to book.",
-                         "urgent", "rotating_light,telescope")
-                  print("Notified about", len(new), "new event(s).")
-              else:
-                  print("No change.", len(events), "bookable event(s).")
+              print("No change.", len(events), "bookable event(s).")
 
-          json.dump({"known": sorted(events), "structure_warned": False}, open(STATE, "w"), indent=2)
+          known, warned = set(events), False
+          save()
           PY
 
       - name: Save state
