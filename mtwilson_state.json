@@ -1,8 +1,6 @@
 {
   "alerted": false,
-  "fails": 2,
-  "known": [
-    "ptn60-091126"
-  ],
+  "fails": 0,
+  "known": [],
   "structure_warned": false
 }
