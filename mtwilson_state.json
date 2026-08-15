@@ -1,6 +1,17 @@
 {
-  "alerted": false,
-  "fails": 2,
-  "known": [],
+  "announce": {
+    "ptn100-101026": 1,
+    "ptn100-110626": 1,
+    "ptn60-100926": 1,
+    "ptn60-110626": 1
+  },
+  "blind_alerted": false,
+  "known": [
+    "ptn100-101026",
+    "ptn100-110626",
+    "ptn60-100926",
+    "ptn60-110626"
+  ],
+  "last_success": "2026-08-15T05:32:13.630837+00:00",
   "structure_warned": false
 }
