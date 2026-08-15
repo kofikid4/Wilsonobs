@@ -20,15 +20,22 @@ jobs:
         run: |
           python3 - <<'PY'
           import gzip, http.cookiejar, json, os, re, sys, time, urllib.request
-          from datetime import datetime, timezone
+          from datetime import datetime, timezone, timedelta
+          from urllib.parse import urljoin
 
           PAGE = "https://www.mtwilson.edu/public-ticket-nights/"
           TOPIC = os.environ["NTFY_TOPIC"]
           STATE = "mtwilson_state.json"
           TIMEOUT = 60
-          ALERT_AFTER = 6
+          MAX_REPEATS = 5     # keep nagging about a newly bookable date this many checks
+          BLIND_HOURS = 8     # warn if no successful check in this long
 
-          # A bare urllib request sends only User-Agent, which reads as a bot.
+          try:
+              from zoneinfo import ZoneInfo
+              LOCAL = ZoneInfo("America/Los_Angeles")
+          except Exception:
+              LOCAL = timezone.utc
+
           HEADERS = {
               "User-Agent": ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"),
@@ -40,8 +47,6 @@ jobs:
               "Sec-Fetch-Dest": "document",
               "Sec-Fetch-Mode": "navigate",
               "Sec-Fetch-Site": "none",
-              "Sec-Fetch-User": "?1",
-              "Cache-Control": "max-age=0",
               "Connection": "close",
           }
 
@@ -50,12 +55,20 @@ jobs:
           LINK = re.compile(
               r'href="https?://(?:www\.)?mtwilson\.edu/events/(ptn[a-z0-9\-]+)/?"[^>]*>\s*([^<]*)',
               re.I)
+          REFRESH = re.compile(
+              r'<meta[^>]+http-equiv=["\']?refresh["\']?[^>]*content=["\']\s*\d+\s*;\s*(?:url=)?([^"\']+)',
+              re.I)
 
-          # Some filters set a cookie and redirect rather than serving the page.
-          opener = urllib.request.build_opener(
-              urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()))
+          jar = http.cookiejar.CookieJar()
+          opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+
+
+          def stamp():
+              return datetime.now(LOCAL).strftime("%a %b %-d, %-I:%M %p %Z")
+
 
           def notify(title, body, priority="default", tags="telescope"):
+              body = "%s\n\n[%s]" % (body, stamp())
               req = urllib.request.Request(
                   "https://ntfy.sh/" + TOPIC, data=body.encode("utf-8"),
                   headers={"Title": title, "Priority": priority, "Tags": tags, "Click": PAGE})
@@ -63,6 +76,38 @@ jobs:
                   urllib.request.urlopen(req, timeout=30).read()
               except Exception as exc:
                   print("Notification failed:", exc)
+
+
+          def fetch(url):
+              req = urllib.request.Request(url, headers=HEADERS)
+              with opener.open(req, timeout=TIMEOUT) as resp:
+                  raw = resp.read()
+                  if resp.headers.get("Content-Encoding", "") == "gzip":
+                      raw = gzip.decompress(raw)
+                  return raw.decode("utf-8", "replace")
+
+
+          def good(html):
+              return bool(LANDMARK.search(html)) and bool(LINK.search(html))
+
+
+          def get_page():
+              html = fetch(PAGE)
+              # SiteGround serves a meta-refresh bot challenge to data-centre IPs.
+              # Follow it so the cookie gets set, then ask for the real page again.
+              m = REFRESH.search(html)
+              if m and not good(html):
+                  target = urljoin(PAGE, m.group(1).replace("&amp;", "&"))
+                  print("  challenge ->", target[:90])
+                  try:
+                      fetch(target)
+                      time.sleep(3)
+                      html = fetch(PAGE)
+                      print("  after challenge: %d bytes, usable=%s" % (len(html), good(html)))
+                  except Exception as exc:
+                      print("  challenge failed:", exc)
+              return html
+
 
           def parse(html):
               m = SOLD_OUT.search(html)
@@ -74,39 +119,33 @@ jobs:
                       found[slug] = text
               return {s: (t or s) for s, t in found.items()}, bool(m)
 
-          def get_page():
-              req = urllib.request.Request(PAGE, headers=HEADERS)
-              with opener.open(req, timeout=TIMEOUT) as resp:
-                  raw = resp.read()
-                  if resp.headers.get("Content-Encoding", "") == "gzip":
-                      raw = gzip.decompress(raw)
-                  return raw.decode("utf-8", "replace"), len(raw), resp.geturl(), resp.status
 
           state = json.load(open(STATE)) if os.path.exists(STATE) else {}
+          first_run = "known" not in state
           known = set(state.get("known", []))
+          announce = dict(state.get("announce", {}))
           warned = bool(state.get("structure_warned"))
-          fails = int(state.get("fails", 0))
-          alerted = bool(state.get("alerted"))
+          blind_alerted = bool(state.get("blind_alerted"))
+          last_ok = state.get("last_success")
+          now = datetime.now(timezone.utc)
+
 
           def save(**kw):
-              base = {"known": sorted(known), "structure_warned": warned,
-                      "fails": fails, "alerted": alerted}
+              base = {"known": sorted(known), "announce": announce,
+                      "structure_warned": warned, "blind_alerted": blind_alerted,
+                      "last_success": last_ok}
               base.update(kw)
               json.dump(base, open(STATE, "w"), indent=2, sort_keys=True)
+
 
           html = None
           for attempt in (1, 2, 3):
               try:
-                  body, size, final_url, status = get_page()
-                  links = len(set(s for s, _ in LINK.findall(body)))
-                  print("attempt %d: status=%s, %d bytes, landmark=%s, links=%d"
-                        % (attempt, status, size, bool(LANDMARK.search(body)), links))
-                  if final_url.rstrip("/") != PAGE.rstrip("/"):
-                      print("  redirected to:", final_url)
-                  if size < 3000:
-                      # Small body means we were refused. Show it so we can identify it.
-                      print("  BODY:", repr(body[:600]))
-                  if LANDMARK.search(body) and links:
+                  body = get_page()
+                  print("attempt %d: %d bytes, usable=%s" % (attempt, len(body), good(body)))
+                  if len(body) < 3000 and not good(body):
+                      print("  BODY:", repr(body[:400]))
+                  if good(body):
                       html = body
                       break
               except Exception as exc:
@@ -115,55 +154,67 @@ jobs:
                   time.sleep(20)
 
           if html is None:
-              fails += 1
-              print("No usable response. Consecutive failures:", fails)
-              if fails >= ALERT_AFTER and not alerted:
+              # Judge blindness by elapsed time, not by a streak: an occasional success
+              # would otherwise reset a counter forever and hide a mostly-blocked watcher.
+              stale = None
+              if last_ok:
+                  stale = now - datetime.fromisoformat(last_ok)
+                  print("No usable response. Last success %.1f h ago." % (stale.total_seconds() / 3600))
+              else:
+                  print("No usable response and no recorded success yet.")
+              if stale and stale > timedelta(hours=BLIND_HOURS) and not blind_alerted:
                   notify("Mount Wilson watcher is blind",
-                         "Could not reach the page on %d checks in a row. Detection is "
-                         "paused until the site responds normally." % fails, "high", "warning")
-                  alerted = True
-              save(fails=fails, alerted=alerted)
+                         "No successful check in %.0f hours. The site is blocking the checker, "
+                         "so new dates may go unnoticed. Worth checking the page yourself."
+                         % (stale.total_seconds() / 3600), "high", "warning")
+                  blind_alerted = True
+              save(blind_alerted=blind_alerted)
               sys.exit(0)
 
-          if alerted:
+          if blind_alerted:
               notify("Mount Wilson watcher is back",
                      "The site is responding again and checks have resumed.",
                      "low", "white_check_mark")
-          if fails:
-              print("Recovered after %d failed check(s)." % fails)
-          fails, alerted = 0, False
+          blind_alerted = False
+          last_ok = now.isoformat()
+          open("last-checked.txt", "w").write(now.strftime("%Y-%m-%d %H:%M UTC") + "\n")
 
           events, saw_marker = parse(html)
-          open("last-checked.txt", "w").write(
-              datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "\n")
 
           if not saw_marker:
               if not warned:
                   notify("Mount Wilson page changed",
-                         "The page loaded normally but the sold out heading is gone, so "
-                         "bookable and sold out cannot be told apart. Worth checking.",
-                         "high", "warning")
+                         "The page loaded normally but the sold out heading is gone, so bookable "
+                         "and sold out cannot be told apart. Worth checking.", "high", "warning")
               warned = True
               save()
               sys.exit(0)
+          warned = False
 
-          print("bookable:", sorted(events))
-          new = sorted(s for s in events if s not in known)
-          if not state:
+          bookable = set(events)
+          print("bookable:", sorted(bookable))
+
+          if first_run:
               listing = "\n".join(sorted(events.values())) or "nothing bookable right now"
               notify("Ticket watcher is live",
                      "Watching Mount Wilson Public Ticket Nights.\n\nCurrently:\n" + listing,
                      "default", "white_check_mark")
-          elif new:
-              notify("New Mount Wilson tickets",
-                     "\n".join(events[s] for s in new) + "\n\nThese sell out fast. Tap to book.",
-                     "urgent", "rotating_light,telescope")
-              print("Notified about", len(new), "new event(s).")
           else:
-              print("No change.", len(events), "bookable event(s).")
+              for s in bookable:
+                  if s not in known:
+                      announce[s] = 0          # newly appeared, start the repeat countdown
+              for s in sorted(announce):
+                  if s in bookable and announce[s] < MAX_REPEATS:
+                      announce[s] += 1
+                      notify("New Mount Wilson tickets (%d of %d)" % (announce[s], MAX_REPEATS),
+                             events[s] + "\n\nStill bookable. These sell out fast.",
+                             "urgent", "rotating_light,telescope")
+                      print("announced %s (%d of %d)" % (s, announce[s], MAX_REPEATS))
 
-          known, warned = set(events), False
+          announce = {s: n for s, n in announce.items() if s in bookable and n < MAX_REPEATS}
+          known = bookable
           save()
+          print("state saved. announce=%s" % announce)
           PY
 
       - name: Save state
